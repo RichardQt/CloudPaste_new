@@ -22,6 +22,6 @@ database_id = "ac469c72ed76bf7b6ae1497363943abd"
 ENCRYPTION_SECRET = "dev-encryption-secret-key"
 
 # [[env.dev.d1_databases]]
-# binding = "DB"
-# database_name = "cloudpaste-db-dev"
-# database_id = "xxxxxxxxxxxxxxxxx" 
+binding = "DB"
+database_name = "cloudpaste-new"
+database_id = "ac469c72ed76bf7b6ae1497363943abd" 
