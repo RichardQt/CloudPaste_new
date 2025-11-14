@@ -170,7 +170,7 @@
     <!-- 上传选项表单 -->
     <div class="upload-form">
       <form @submit.prevent="submitUpload">
-        <!-- S3配置选择 -->
+        <!-- 存储配置选择 -->
         <div class="mb-6">
           <h3 class="text-lg font-medium mb-4" :class="darkMode ? 'text-gray-200' : 'text-gray-700'">{{ t("file.storage") }}</h3>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -185,11 +185,11 @@
                       ? 'bg-gray-700 border-gray-600 text-white focus:ring-blue-600 focus:ring-offset-gray-800'
                       : 'bg-white border-gray-300 text-gray-900 focus:ring-blue-500 focus:ring-offset-white',
                   ]"
-                  :disabled="!s3Configs.length || loading || isUploading"
+                  :disabled="!storageConfigs.length || loading || isUploading"
                   required
                 >
-                  <option value="" disabled selected>{{ s3Configs.length ? t("file.selectStorage") : t("file.noStorage") }}</option>
-                  <option v-for="config in s3Configs" :key="config.id" :value="config.id">{{ config.name }} ({{ config.provider_type }})</option>
+                  <option value="" disabled selected>{{ storageConfigs.length ? t("file.selectStorage") : t("file.noStorage") }}</option>
+                  <option v-for="config in storageConfigs" :key="config.id" :value="config.id">{{ formatStorageOptionLabel(config) }}</option>
                 </select>
                 <div class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none">
                   <svg
@@ -443,603 +443,375 @@
 </template>
 
 <script setup>
-import { ref, reactive, defineProps, defineEmits, watch, computed } from "vue";
+import { ref, computed, defineProps, defineEmits, onMounted, onBeforeUnmount, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { api } from "@/api";
-// 导入文件类型工具
-import { getFileIcon } from "../../utils/fileTypeIcons";
+import { getFileIcon } from "@/utils/fileTypeIcons";
 import { formatFileSize as formatFileSizeUtil } from "@/utils/fileTypes.js";
-import { validateUrlInfo } from "../../api/services/urlUploadService.js";
-
-const { t } = useI18n(); // 初始化i18n
+import { useShareSettingsForm } from "@/composables/upload/useShareSettingsForm.js";
+import { useStorageConfigsStore } from "@/stores/storageConfigsStore.js";
+import { useUploaderClient } from "@/composables/upload/useUploaderClient.js";
 
 const props = defineProps({
-  darkMode: {
-    type: Boolean,
-    default: false,
-  },
-  s3Configs: {
-    type: Array,
-    default: () => [],
-  },
-  loading: {
-    type: Boolean,
-    default: false,
-  },
-  isAdmin: {
-    type: Boolean,
-    default: false,
-  },
+  darkMode: { type: Boolean, default: false },
+  storageConfigs: { type: Array, default: () => [] },
+  loading: { type: Boolean, default: false },
+  isAdmin: { type: Boolean, default: false },
 });
 
 const emit = defineEmits(["upload-success", "upload-error", "refresh-files"]);
+const { t } = useI18n();
+const storageConfigsStore = useStorageConfigsStore();
+const uploaderClient = useUploaderClient();
+const activeUrlSession = ref(null);
+const disposeUrlSession = () => {
+  try {
+    activeUrlSession.value?.destroy?.();
+  } catch {}
+  activeUrlSession.value = null;
+};
+const {
+  formData,
+  slugError,
+  validateSlug,
+  handleSlugInput,
+  handleMaxViewsInput,
+  selectDefaultStorageConfig,
+  resetShareSettings,
+} = useShareSettingsForm();
 
-// URL输入和状态
+const storageConfigs = computed(() => {
+  if (props.storageConfigs && props.storageConfigs.length) {
+    return props.storageConfigs;
+  }
+  return storageConfigsStore.sortedConfigs;
+});
+
+watch(
+  storageConfigs,
+  (configs) => {
+    if (!configs || configs.length === 0) {
+      return;
+    }
+    if (formData.storage_config_id && configs.some((config) => config.id === formData.storage_config_id)) {
+      return;
+    }
+    const defaultConfig = configs.find((config) => config.is_default);
+    formData.storage_config_id = (defaultConfig || configs[0]).id;
+  },
+  { immediate: true }
+);
+
 const urlInput = ref("");
 const urlError = ref("");
 const isAnalyzing = ref(false);
 const fileInfo = ref(null);
 const customFilename = ref("");
 
-// 上传状态
 const isUploading = ref(false);
 const uploadProgress = ref(0);
 const uploadSpeed = ref("");
+const currentStage = ref("starting");
 const activeXhr = ref(null);
+const isCancelled = ref(false);
 const lastLoaded = ref(0);
 const lastTime = ref(0);
-const slugError = ref("");
-const isCancelled = ref(false); // 取消上传标志
-const currentStage = ref("starting"); // 添加 currentStage 状态变量
 
-// 表单数据
-const formData = reactive({
-  storage_config_id: "",
-  slug: "",
-  path: "",
-  remark: "",
-  password: "",
-  expires_in: "0", // 默认永不过期
-  max_views: 0, // 默认无限制
-});
-
-// 计算属性：显示友好的文件大小
 const displayFileSize = computed(() => {
-  // 如果有明确的大小信息，使用它
-  if (fileInfo.value && fileInfo.value.size !== null && fileInfo.value.size !== undefined && fileInfo.value.size > 0) {
-    return formatFileSize(fileInfo.value.size);
+  const info = fileInfo.value;
+  if (info && typeof info.size === "number" && info.size > 0) {
+    return formatFileSizeUtil(info.size);
   }
-
-  // 如果没有大小信息，显示"未知大小"
   return t("file.unknownSize");
 });
 
-// 计算属性：显示友好的MIME类型
 const displayMimeType = computed(() => {
-  if (!fileInfo.value) return null;
-
-  // 优先显示 contentType，再显示后端的 typeName
-  if (fileInfo.value.contentType && fileInfo.value.contentType !== "application/octet-stream") {
-    console.log("✅ 使用 contentType:", fileInfo.value.contentType);
-    return fileInfo.value.contentType;
+  const info = fileInfo.value;
+  if (!info) return null;
+  if (info.contentType && info.contentType !== "application/octet-stream") {
+    return info.contentType;
   }
-
-  // 如果 contentType 无效，使用后端返回的 typeName
-  if (fileInfo.value.typeName && fileInfo.value.typeName !== "unknown") {
-    console.log("✅ 使用 typeName:", fileInfo.value.typeName);
-    return fileInfo.value.typeName;
+  if (info.typeName && info.typeName !== "unknown") {
+    return info.typeName;
   }
-
-  // 最后回退：不显示类型信息
   return null;
 });
 
-// 计算属性：解码并显示文件名
 const displayFilename = computed(() => {
-  if (!fileInfo.value || !fileInfo.value.filename) {
-    return "Unknown File";
+  const info = fileInfo.value;
+  if (!info || !info.filename) {
+    return "unknown";
   }
-
   try {
-    // 尝试URL解码文件名
-    return decodeURIComponent(fileInfo.value.filename);
-  } catch (e) {
-    console.warn("解码文件名失败:", e);
-    return fileInfo.value.filename; // 如果解码失败，返回原始文件名
+    return decodeURIComponent(info.filename);
+  } catch (error) {
+    return info.filename;
   }
 });
 
-// 监听s3Configs变化，自动选择默认配置
-watch(
-  () => props.s3Configs,
-  (configs) => {
-    if (configs && configs.length > 0) {
-      // 查找默认配置
-      const defaultConfig = configs.find((config) => config.is_default);
-      if (defaultConfig) {
-        // 使用默认配置的ID
-        formData.storage_config_id = defaultConfig.id;
-      } else if (!formData.storage_config_id && configs.length > 0) {
-        // 如果没有默认配置且当前未选择配置，则选择第一个
-        formData.storage_config_id = configs[0].id;
-      }
-    }
-  },
-  { immediate: true } // 页面加载时立即执行
-);
-
-/**
- * 获取与文件类型匹配的SVG图标
- * @param {string} filename - 文件名
- * @returns {string} SVG图标HTML字符串
- */
 const getFileIconClassLocal = (filename) => {
-  if (!filename) return getDefaultFileIcon();
-  const mockFileItem = {
-    name: filename,
-    isDirectory: false,
-    type: fileInfo.value?.type || 0,
+  const mock = {
+    extension: filename?.split(".").pop() || "",
+    mime: fileInfo.value?.contentType || "",
+    darkMode: props.darkMode,
   };
-
-  return getFileIcon(mockFileItem, props.darkMode);
+  return getFileIcon(mock, props.darkMode);
 };
 
-/**
- * 获取默认文件图标
- * @returns {string} 默认文件图标SVG字符串
- */
-const getDefaultFileIcon = () => {
-  return `<svg xmlns="http://www.w3.org/2000/svg" class="h-full w-full" viewBox="0 0 24 24" fill="none">
-    <path d="M14 2H6C5.46957 2 4.96086 2.21071 4.58579 2.58579C4.21071 2.96086 4 3.46957 4 4V20C4 20.5304 4.21071 21.0391 4.58579 21.4142C4.96086 21.7893 5.46957 22 6 22H18C18.5304 22 19.0391 21.7893 19.4142 21.4142C19.7893 21.0391 20 20.5304 20 20V8L14 2Z"
-      stroke="${props.darkMode ? "#93c5fd" : "#3b82f6"}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="${
-    props.darkMode ? "#93c5fd" : "#3b82f6"
-  }" fill-opacity="${props.darkMode ? "0.1" : "0.1"}"/>
-    <path d="M14 2V8H20" stroke="${props.darkMode ? "#93c5fd" : "#3b82f6"}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-  </svg>`;
+const formatStorageOptionLabel = (config) => {
+  if (!config) {
+    return t("file.storage");
+  }
+  const meta = config.provider_type || config.storage_type;
+  return meta ? `${config.name} (${meta})` : config.name;
 };
 
-/**
- * 解析URL获取文件信息
- */
+const isValidUrl = (value) => {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch (error) {
+    return false;
+  }
+};
+
+const formatSpeed = (bytesPerSecond) => {
+  if (bytesPerSecond < 1024) {
+    return `${bytesPerSecond.toFixed(0)} B/s`;
+  }
+  if (bytesPerSecond < 1024 * 1024) {
+    return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
+  }
+  return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
+};
+
 const analyzeUrl = async () => {
-  if (!urlInput.value || isAnalyzing.value || isUploading.value) return;
-
-  // 清除之前的错误
   urlError.value = "";
   fileInfo.value = null;
+  if (!urlInput.value) return;
+  if (!isValidUrl(urlInput.value)) {
+    urlError.value = t("file.messages.invalidUrl");
+    return;
+  }
+
   isAnalyzing.value = true;
-
   try {
-    // 验证URL格式
-    if (!isValidUrl(urlInput.value)) {
-      urlError.value = t("file.messages.invalidUrl");
-      isAnalyzing.value = false;
-      return;
+    const response = await api.urlUpload.validateUrlInfo(urlInput.value);
+    if (!response?.success) {
+      throw new Error(response?.message || t("file.messages.urlAnalysisFailed"));
     }
-
-    console.log("开始URL验证和增强检测:", urlInput.value);
-
-    // 使用后端API进行URL验证和增强MIME检测
-    const response = await validateUrlInfo(urlInput.value);
-
-    if (response.success && response.data) {
-      const metadata = response.data;
-
-      // 构建兼容的文件信息对象
-      const data = {
-        url: metadata.url,
-        filename: metadata.filename,
-        contentType: metadata.enhancedContentType || metadata.contentType,
-        size: metadata.size,
-        lastModified: metadata.lastModified,
-        corsSupported: metadata.corsSupported,
-        mimetype: metadata.enhancedContentType || metadata.contentType,
-        detectionMethod: metadata.detectionMethod,
-        detectionConfidence: metadata.detectionConfidence,
-        fileTypeLibraryUsed: metadata.fileTypeLibraryUsed,
-        type: metadata.type,
-        typeName: metadata.typeName,
-      };
-
-      fileInfo.value = data;
-
-      // 显示检测信息
-      if (metadata.fileTypeLibraryUsed) {
-        console.log(`✅ 后端file-type检测成功: ${metadata.contentType} (置信度: ${metadata.detectionConfidence})`);
-      } else {
-        console.log(`📡 传统检测: ${metadata.contentType}`);
-      }
-    } else {
-      throw new Error(response.message || "URL验证失败");
-    }
-
-    // 设置自定义文件名
-    if (fileInfo.value.filename) {
-      try {
-        customFilename.value = decodeURIComponent(fileInfo.value.filename);
-      } catch (e) {
-        console.warn("解码文件名失败:", e);
-        customFilename.value = fileInfo.value.filename || "";
-      }
-    } else {
-      customFilename.value = "";
-    }
+    fileInfo.value = response.data || null;
+    customFilename.value = response.data?.filename || "";
+    currentStage.value = "analysis";
   } catch (error) {
-    console.error("URL验证失败:", error);
     urlError.value = error.message || t("file.messages.urlAnalysisFailed");
+    fileInfo.value = null;
   } finally {
     isAnalyzing.value = false;
   }
 };
 
-/**
- * 清除文件信息
- */
 const clearFileInfo = () => {
-  if (isUploading.value) return;
   fileInfo.value = null;
   customFilename.value = "";
+  uploadProgress.value = 0;
+  uploadSpeed.value = "";
+  currentStage.value = "starting";
+  urlError.value = "";
+  resetShareSettings({ keepStorage: true });
 };
 
-/**
- * 验证URL格式是否有效
- * @param {string} url - 要验证的URL
- * @returns {boolean} URL是否有效
- */
-const isValidUrl = (url) => {
-  try {
-    const parsedUrl = new URL(url);
-    return parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:";
-  } catch (e) {
+const validateMaxViews = (event) => {
+  handleMaxViewsInput(event?.target?.value ?? 0);
+};
+
+const validateCustomLink = (event) => {
+  handleSlugInput(event?.target?.value ?? formData.slug);
+  return validateSlug();
+};
+
+const ensurePreconditions = () => {
+  if (!fileInfo.value) {
+    emit("upload-error", new Error(t("file.messages.noFilesSelected")));
     return false;
   }
-};
-
-/**
- * 格式化文件大小
- * @param {number} bytes - 文件字节数
- * @returns {string} 格式化后的文件大小
- */
-const formatFileSize = (bytes) => {
-  return formatFileSizeUtil(bytes);
-};
-
-/**
- * 格式化上传速度
- * @param {number} bytesPerSecond - 每秒字节数
- * @returns {string} 格式化后的上传速度
- */
-const formatSpeed = (bytesPerSecond) => {
-  if (bytesPerSecond < 1024) {
-    return `${Math.round(bytesPerSecond)} B/s`;
-  } else if (bytesPerSecond < 1024 * 1024) {
-    return `${Math.round((bytesPerSecond / 1024) * 10) / 10} KB/s`;
-  } else {
-    return `${Math.round((bytesPerSecond / (1024 * 1024)) * 10) / 10} MB/s`;
-  }
-};
-
-/**
- * 清理文件的所有上传相关引用和状态
- * @param {Object} fileItem - 文件项对象
- */
-const cleanupFileUploadReferences = (fileItem) => {
-  if (fileItem.xhr) {
-    try {
-      fileItem.xhr.abort();
-    } catch (error) {
-      console.warn("清理xhr时出错:", error);
+  if (!formData.storage_config_id) {
+    selectDefaultStorageConfig();
+    if (!formData.storage_config_id) {
+      emit("upload-error", new Error(t("file.messages.noStorageConfig")));
+      return false;
     }
-    fileItem.xhr = null;
   }
-
-  // 清理其他上传相关状态
-  fileItem.uploadStartTime = null;
-  fileItem.lastProgressTime = null;
-};
-
-/**
- * 验证自定义链接
- * @returns {boolean} 验证是否通过
- */
-const validateCustomLink = () => {
-  slugError.value = "";
-
-  // 如果为空则不验证（使用随机生成的slug）
-  if (!formData.slug) {
-    return true;
-  }
-
-  // 验证格式：只允许字母、数字、连字符、下划线、点号
-  const slugRegex = /^[a-zA-Z0-9._-]+$/;
-  if (!slugRegex.test(formData.slug)) {
-    slugError.value = t("file.messages.slugInvalid");
+  if (Number(formData.max_views) < 0) {
+    emit("upload-error", new Error(t("file.messages.negativeMaxViews")));
     return false;
   }
-
+  if (formData.slug && !validateSlug()) {
+    emit("upload-error", new Error(slugError.value));
+    return false;
+  }
   return true;
 };
 
-/**
- * 验证并处理可打开次数的输入
- * 确保输入的是有效的非负整数
- * @param {Event} event - 输入事件对象
- */
-const validateMaxViews = (event) => {
-  // 获取输入的值
-  const value = event.target.value;
-
-  // 如果是负数，则设置为0
-  if (value < 0) {
-    formData.max_views = 0;
-    return;
+const buildPayload = () => {
+  if (!formData.remark) {
+    const maxLength = 100;
+    const shortUrl = urlInput.value.length > maxLength ? `${urlInput.value.slice(0, maxLength)}...` : urlInput.value;
+    formData.remark = `[${t("file.urlUpload.urlUpload")}]${shortUrl}`;
   }
+  return {
+    storage_config_id: formData.storage_config_id,
+    slug: formData.slug || "",
+    path: formData.path || "",
+    remark: formData.remark || "",
+    password: formData.password || "",
+    expires_in: formData.expires_in || "0",
+    max_views: Math.max(0, Number(formData.max_views) || 0),
+  };
+};
 
-  // 如果包含小数点，截取整数部分
-  if (value.toString().includes(".")) {
-    formData.max_views = parseInt(value);
-  }
-
-  // 确保值为有效数字
-  if (isNaN(value) || value === "") {
-    formData.max_views = 0;
-  } else {
-    // 确保是整数
-    formData.max_views = parseInt(value);
+const updateSpeedMeter = (loaded) => {
+  const now = Date.now();
+  const elapsed = (now - lastTime.value) / 1000;
+  if (elapsed > 0.5) {
+    const delta = loaded - lastLoaded.value;
+    uploadSpeed.value = formatSpeed(delta / elapsed);
+    lastLoaded.value = loaded;
+    lastTime.value = now;
   }
 };
 
-/**
- * 提交URL上传
- * 根据选择的上传方式（预签名直传或分片上传）执行相应的上传逻辑
- */
+const handleProgress = ({ percent = 0, loaded = 0, total = fileInfo.value?.size || 1, stage }) => {
+  uploadProgress.value = Math.min(100, Math.round(percent));
+  if (stage === "downloading") {
+    currentStage.value = "downloading";
+  } else if (stage === "uploading") {
+    currentStage.value = "uploading";
+  }
+  updateSpeedMeter(loaded);
+};
+
+const handleStageChange = (stage) => {
+  if (stage === "presign") {
+    currentStage.value = "initializing";
+  } else if (stage === "transfer") {
+    currentStage.value = "uploading";
+  } else if (stage === "commit") {
+    currentStage.value = "finalizing";
+  }
+};
+
 const submitUpload = async () => {
-  if (!fileInfo.value || !formData.storage_config_id || isUploading.value) return;
-
-  // 验证可打开次数，确保是非负整数
-  if (formData.max_views < 0) {
-    emit("upload-error", new Error(t("file.messages.negativeMaxViews")));
-    return;
-  }
-
-  // 验证自定义链接格式
-  if (formData.slug && !validateCustomLink()) {
-    emit("upload-error", new Error(slugError.value));
-    return;
-  }
-
-  // 处理默认备注格式
-  // 如果用户没有输入备注，则设置默认格式为"[url直链]URL地址"
-  if (!formData.remark) {
-    // 截取URL，如果太长则截断
-    const maxUrlLength = 100;
-    const shortUrl = urlInput.value.length > maxUrlLength ? urlInput.value.substring(0, maxUrlLength) + "..." : urlInput.value;
-
-    formData.remark = `[${t("file.urlUpload.urlUpload")}]${shortUrl}`;
-  }
+  if (!ensurePreconditions() || isUploading.value) return;
 
   isUploading.value = true;
+  isCancelled.value = false;
   uploadProgress.value = 0;
   uploadSpeed.value = "";
-
-  // 重置上传速度计算相关变量
+  currentStage.value = "starting";
   lastLoaded.value = 0;
   lastTime.value = Date.now();
 
+  const payload = buildPayload();
+  const meta = fileInfo.value || {};
+  const filename = customFilename.value || meta.filename || "url-upload.bin";
+
   try {
-    await presignedDirectUpload();
-
-    // 上传成功，通知父组件
-    emit("upload-success", {
-      message: t("file.urlUploadSuccess"),
+    // 下载阶段（0-49%）
+    handleStageChange("presign");
+    handleStageChange("transfer");
+    const blob = await api.urlUpload.fetchUrlContent({
       url: urlInput.value,
-      fileInfo: fileInfo.value,
-    });
-
-    // 刷新文件列表
-    emit("refresh-files");
-
-    // 重置表单
-    resetForm();
-  } catch (error) {
-    console.error("URL上传失败:", error);
-    emit("upload-error", error);
-  } finally {
-    isUploading.value = false;
-  }
-};
-
-/**
- * 预签名直传方式
- * 先从URL获取内容，然后使用预签名URL上传到S3
- */
-const presignedDirectUpload = async () => {
-  try {
-    // 重置取消标志
-    isCancelled.value = false;
-
-    // 设置初始阶段和进度
-    currentStage.value = "starting";
-    uploadProgress.value = 5;
-
-    // 1. 获取预签名URL
-    currentStage.value = "initializing";
-
-    const presignedResponse = await api.urlUpload.getUrlUploadPresignedUrl({
-      url: urlInput.value,
-      storage_config_id: formData.storage_config_id,
-      filename: customFilename.value || fileInfo.value?.filename,
-      path: formData.path,
-      contentType: fileInfo.value?.contentType,
-      fileSize: fileInfo.value?.size,
-    });
-
-    if (!presignedResponse.success || !presignedResponse.data) {
-      throw new Error(t("file.messages.getPresignedUrlFailed"));
-    }
-
-    const presignBundle = presignedResponse.data;
-    const presignData = presignBundle.presign || presignBundle;
-    const commitSuggestion = presignBundle.commit_suggestion || presignBundle.commitSuggestion;
-
-    if (!presignData?.uploadUrl || !presignData?.key) {
-      throw new Error(t("file.messages.getPresignedUrlFailed"));
-    }
-
-    if (isCancelled.value) {
-      throw new Error(t("file.messages.uploadCancelled"));
-    }
-
-    uploadProgress.value = 10;
-
-    // 2. 使用预签名URL上传文件
-    currentStage.value = "uploading";
-
-    const uploadResult = await api.urlUpload.uploadFromUrlToS3({
-      url: urlInput.value,
-      uploadUrl: presignData.uploadUrl || presignData.upload_url,
-      onProgress: (progress, loaded, _total, phase) => {
-        // 如果已取消，不再更新进度
-        if (isCancelled.value) return;
-
-        uploadProgress.value = progress;
-
-        // 根据phase更新阶段
-        if (phase === "downloading") {
-          currentStage.value = "downloading";
-        } else if (phase === "uploading") {
-          currentStage.value = "uploading";
-        }
-
-        // 更新上传速度
-        const now = Date.now();
-        const timeElapsed = (now - lastTime.value) / 1000; // 转换为秒
-
-        if (timeElapsed > 0.5) {
-          // 每0.5秒更新一次速度
-          const loadedChange = loaded - lastLoaded.value; // 这段时间内上传的字节数
-          const speed = loadedChange / timeElapsed; // 字节/秒
-
-          uploadSpeed.value = formatSpeed(speed);
-
-          // 更新上次加载值和时间
-          lastLoaded.value = loaded;
-          lastTime.value = now;
-        }
+      onProgress: (progress, loaded, total) => {
+        handleProgress({ percent: progress, loaded, total, stage: "downloading" });
       },
-      // 传递xhr引用的设置函数，以便能够取消请求
       setXhr: (xhr) => {
         activeXhr.value = xhr;
       },
     });
-
-    // 如果已经取消，则中止上传
-    if (isCancelled.value) {
-      throw new Error(t("file.messages.uploadCancelled"));
-    }
-
-    // 3. 提交完成信息
-    currentStage.value = "finalizing";
-
-    const commitKey = commitSuggestion?.key || presignData.key;
-    const commitStorageConfigId = commitSuggestion?.storage_config_id || presignData.storage_config_id || null;
-    const commitFilename =
-      customFilename.value || commitSuggestion?.filename || presignData.filename || presignData.fileName || fileInfo.value?.filename || "url-upload.bin";
-
-    if (!commitKey || !commitStorageConfigId) {
-      throw new Error(t("file.messages.getPresignedUrlFailed"));
-    }
-
-    await api.urlUpload.commitUrlUpload({
-      key: commitKey,
-      storage_config_id: commitStorageConfigId,
-      filename: commitFilename,
-      etag: uploadResult.etag,
-      size: uploadResult.size,
-      remark: formData.remark,
-      password: formData.password,
-      expires_in: Number(formData.expires_in),
-      max_views: formData.max_views,
-      slug: formData.slug,
+    // 上传阶段（50-100%）
+    handleStageChange("upload");
+    disposeUrlSession();
+    const session = uploaderClient.createUrlUploadSession({
+      payload,
+      events: {
+        onProgress: ({ percent, bytesUploaded, bytesTotal }) => {
+          const translatedPercent = 50 + Math.round((Math.min(100, percent) / 100) * 49);
+          handleProgress({ percent: translatedPercent, loaded: bytesUploaded, total: bytesTotal || blob.size || 1, stage: "uploading" });
+        },
+        onError: ({ error }) => {
+          if (isCancelled.value) return;
+          emit("upload-error", error);
+        },
+        onComplete: () => {
+          currentStage.value = "completed";
+          uploadProgress.value = 100;
+          uploadSpeed.value = "";
+          emit("upload-success", { message: t("file.urlUploadSuccess"), url: urlInput.value, fileInfo: fileInfo.value });
+          emit("refresh-files");
+          resetForm();
+        },
+      },
     });
-
-    // 完成
-    currentStage.value = "completed";
-    uploadProgress.value = 100;
-    uploadSpeed.value = "";
-
-    return true;
+    session.addFiles([
+      {
+        data: blob,
+        name: filename,
+        type: meta.contentType || blob.type || "application/octet-stream",
+      },
+    ], () => ({ filename, sourceUrl: urlInput.value }));
+    activeUrlSession.value = session;
+    await session.start();
   } catch (error) {
-    console.error("客户端URL上传失败:", error);
-    throw error;
+    if (isCancelled.value) {
+      currentStage.value = "cancelled";
+    } else {
+      emit("upload-error", error);
+    }
+  } finally {
+    isUploading.value = false;
+    activeXhr.value = null;
+    isCancelled.value = false;
+    disposeUrlSession();
   }
 };
 
-/**
- * 分片上传方式
- * 先从URL获取内容，然后使用分片上传到S3
- */
-/**
- * 取消上传
- */
-const cancelUpload = async () => {
+const cancelUpload = () => {
   if (!isUploading.value) return;
-
-  // 设置取消标志
   isCancelled.value = true;
-
-  // 设置取消状态
   currentStage.value = "cancelled";
-
-  // 使用统一的清理函数清理所有上传引用
-  const tempFileItem = {
-    xhr: activeXhr.value,
-  };
-  cleanupFileUploadReferences(tempFileItem);
-
-  activeXhr.value = null;
-
-  isUploading.value = false;
   uploadProgress.value = 0;
   uploadSpeed.value = "";
-
-  emit("upload-error", new Error(t("file.uploadCancelled")));
+  activeXhr.value?.abort?.();
+  try { activeUrlSession.value?.cancel?.(); } catch {}
+  disposeUrlSession();
+  emit("upload-error", new Error(t("file.messages.uploadCancelled")));
 };
 
-/**
- * 重置表单
- */
 const resetForm = () => {
   urlInput.value = "";
+  urlError.value = "";
   fileInfo.value = null;
   customFilename.value = "";
   uploadProgress.value = 0;
   uploadSpeed.value = "";
-  urlError.value = "";
-  isCancelled.value = false;
-  currentStage.value = ""; // 重置上传阶段
-
-  // 使用统一的清理函数清理所有上传引用
-  const tempFileItem = {
-    xhr: activeXhr.value,
-  };
-  cleanupFileUploadReferences(tempFileItem);
-
+  currentStage.value = "starting";
+  activeXhr.value?.abort?.();
   activeXhr.value = null;
-
-  // 保留S3配置ID，重置其他表单字段
-  const s3ConfigId = formData.storage_config_id;
-  Object.assign(formData, {
-    storage_config_id: s3ConfigId,
-    slug: "",
-    path: "",
-    remark: "",
-    password: "",
-    expires_in: "0",
-    max_views: 0,
-  });
+  isCancelled.value = false;
+  resetShareSettings({ keepStorage: true });
+  disposeUrlSession();
 };
+
+onMounted(() => {
+  selectDefaultStorageConfig();
+});
+
+onBeforeUnmount(() => {
+  disposeUrlSession();
+});
 </script>
+
 
 <style scoped>
 .upload-form {
@@ -1121,3 +893,4 @@ const resetForm = () => {
   box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
 }
 </style>
+
